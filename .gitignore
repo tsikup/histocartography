@@ -117,3 +117,5 @@ tmp/
 .DS_Store
 checkpoints
 .travis.yml
+
+.idea/

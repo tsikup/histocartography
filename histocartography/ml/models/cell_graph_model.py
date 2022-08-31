@@ -106,12 +106,13 @@ class CellGraphModel(BaseModel):
         else:
             emd_dim = self.gnn_params['output_dim']
 
-        self.pred_layer = MLP(
-            in_dim=emd_dim,
-            hidden_dim=self.classification_params['hidden_dim'],
-            out_dim=self.num_classes,
-            num_layers=self.classification_params['num_layers']
-        )
+        if self.classification_params['include_mlp']:
+            self.pred_layer = MLP(
+                in_dim=emd_dim,
+                hidden_dim=self.classification_params['hidden_dim'],
+                out_dim=self.num_classes,
+                num_layers=self.classification_params['num_layers']
+            )
 
     def forward(
         self,
@@ -136,8 +137,10 @@ class CellGraphModel(BaseModel):
             adj, feats = graph[0], graph[1]
             graph_embeddings = self.cell_graph_gnn(adj, feats)
 
-        # 2. Run readout function
-        out = self.pred_layer(graph_embeddings)
+        out = graph_embeddings
+        if self.classification_params['include_mlp']:
+            # 2. Run readout function
+            out = self.pred_layer(out)
 
         return out
 

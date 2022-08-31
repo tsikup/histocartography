@@ -2,6 +2,7 @@
 
 import copy
 import math
+import os
 import warnings
 from abc import abstractmethod
 from pathlib import Path
@@ -14,10 +15,8 @@ import numpy as np
 import pandas as pd
 import torch
 import torchvision
-from histocartography.preprocessing.tissue_mask import GaussianTissueMask
-from histocartography.utils import dynamic_import_from
 from scipy.stats import skew
-from skimage.feature import greycomatrix, greycoprops
+from skimage.feature import graycomatrix, graycoprops
 from skimage.filters.rank import entropy as Entropy
 from skimage.measure import regionprops
 from skimage.morphology import disk
@@ -27,6 +26,9 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from tqdm.auto import tqdm
 
+from ..preprocessing.tissue_mask import GaussianTissueMask
+from ..utils import dynamic_import_from, download_box_link
+from .nuclei_extraction import CHECKPOINT_PATH, DATASET_TO_BOX_URL
 from ..pipeline import PipelineStep
 
 
@@ -249,19 +251,19 @@ class HandcraftedFeatureExtractor(FeatureExtractor):
             ]
 
             # GLCM texture features (gray color space) [5 features]
-            glcm = greycomatrix(sp_gray, [1], [0])
+            glcm = graycomatrix(sp_gray, [1], [0])
             # Filter out the first row and column
             filt_glcm = glcm[1:, 1:, :, :]
 
-            glcm_contrast = greycoprops(filt_glcm, prop="contrast")
+            glcm_contrast = graycoprops(filt_glcm, prop="contrast")
             glcm_contrast = glcm_contrast[0, 0]
-            glcm_dissimilarity = greycoprops(filt_glcm, prop="dissimilarity")
+            glcm_dissimilarity = graycoprops(filt_glcm, prop="dissimilarity")
             glcm_dissimilarity = glcm_dissimilarity[0, 0]
-            glcm_homogeneity = greycoprops(filt_glcm, prop="homogeneity")
+            glcm_homogeneity = graycoprops(filt_glcm, prop="homogeneity")
             glcm_homogeneity = glcm_homogeneity[0, 0]
-            glcm_energy = greycoprops(filt_glcm, prop="energy")
+            glcm_energy = graycoprops(filt_glcm, prop="energy")
             glcm_energy = glcm_energy[0, 0]
-            glcm_ASM = greycoprops(filt_glcm, prop="ASM")
+            glcm_ASM = graycoprops(filt_glcm, prop="ASM")
             glcm_ASM = glcm_ASM[0, 0]
             glcm_dispersion = np.std(filt_glcm)
 
@@ -1312,6 +1314,247 @@ class MaskedGridDeepFeatureExtractor(GridDeepFeatureExtractor):
         # extract features of all patches
         features = self.patch_feature_extractor(img_patches)
         return index_filter, features
+
+
+class PatchHoverNetFeatureExtractor:
+    """Helper class to use a CNN to extract features from an image"""
+
+    def __init__(
+        self,
+        model_path,
+        device: torch.device,
+        patch_size: int,
+        pretrained_data: str = "pannuke",
+        extraction_layer: Optional[str] = None,
+    ) -> None:
+        """
+        Create a patch feature extracter of a given architecture and put it on GPU if available.
+
+        Args:
+            architecture (str): String of architecture. According to torchvision.models syntax.
+            device (torch.device): Torch Device.
+            patch_size (int): Desired size of patch.
+            extraction_layer (Optional[str]): Name of the network module from where the features are extracted.
+        """
+        self.device = device
+
+        self.pretrained_data = pretrained_data
+        self.model = self._get_hovernet_model(model_path)
+
+        # self._validate_model(model)
+        # self.model = self._remove_layers(model, extraction_layer)
+        self.num_features = self._get_num_features(self.model, patch_size)
+        self.model.eval()
+
+    def _get_num_features(self, model: nn.Module, patch_size: int) -> int:
+        """
+        Get the number of features of a given model.
+
+        Args:
+            model (nn.Module): A PyTorch model.
+            patch_size (int): Desired size of patch.
+
+        Returns:
+            int: Number of output features.
+        """
+        dummy_patch = torch.zeros(1, 3, patch_size, patch_size).to(self.device)
+        features = model(dummy_patch)
+        features = torch.mean(features, dim=(-1, -2))
+        return features.shape[-1]
+
+    def _get_local_model(self, path: str) -> nn.Module:
+        """
+        Load a model from a local path.
+
+        Args:
+            path (str): Path to the model.
+
+        Returns:
+            nn.Module: A PyTorch model.
+        """
+        model = torch.load(path, map_location=self.device)
+        return model
+
+    def _get_hovernet_model(self, model_path):
+        if model_path is None:
+            assert self.pretrained_data in [
+                "pannuke",
+                "monusac",
+            ], 'Unsupported pretrained data checkpoint. Options are "pannuke" and "monusac".'
+            model_path = os.path.join(
+                os.path.dirname(__file__), CHECKPOINT_PATH, self.pretrained_data + ".pt"
+            )
+            download_box_link(DATASET_TO_BOX_URL[self.pretrained_data], model_path)
+
+        model = self._get_local_model(model_path)
+        # get encoder only
+        model = list(model.children())[0]
+        model = nn.Sequential(*list(model.children()))
+        return model
+
+    def __call__(self, patch: torch.Tensor) -> torch.Tensor:
+        """
+        Computes the embedding of a normalized image input.
+
+        Args:
+            image (torch.Tensor): Normalized image input.
+
+        Returns:
+            torch.Tensor: Embedding of image.
+        """
+        patch = patch.to(self.device)
+        with torch.no_grad():
+            embeddings = self.model(patch)
+            embeddings = torch.mean(embeddings, dim=(-1, -2)).squeeze()
+        return embeddings
+
+
+class HoverNetDeepFeatureExtractor(FeatureExtractor):
+    """Helper class to extract deep features from instance maps"""
+
+    def __init__(
+        self,
+        model_path: str,
+        patch_size: int,
+        resize_size: int = None,
+        stride: int = None,
+        downsample_factor: int = 1,
+        normalizer: Optional[dict] = None,
+        batch_size: int = 32,
+        fill_value: int = 255,
+        num_workers: int = 0,
+        verbose: bool = False,
+        with_instance_masking: bool = False,
+        extraction_layer: str = None,
+        **kwargs,
+    ) -> None:
+        """
+        Create a deep feature extractor.
+
+        Args:
+            model_path (str): Model path
+            patch_size (int): Desired size of patch.
+            resize_size (int): Desired resized size to input the network. If None, no resizing is done and the
+                               patches of size patch_size are provided to the network. Defaults to None.
+            stride (int): Desired stride for patch extraction. If None, stride is set to patch size. Defaults to None.
+            downsample_factor (int): Downsampling factor for image analysis. Defaults to 1.
+            normalizer (dict): Dictionary of channel-wise mean and standard deviation for image
+                               normalization. If None, using ImageNet normalization factors. Defaults to None.
+            batch_size (int): Batch size during processing of patches. Defaults to 32.
+            fill_value (int): Constant pixel value for image padding. Defaults to 255.
+            num_workers (int): Number of workers in data loader. Defaults to 0.
+            verbose (bool): tqdm processing bar. Defaults to False.
+            with_instance_masking (bool): If pixels outside instance should be masked. Defaults to False.
+        """
+        self.patch_size = patch_size
+        self.resize_size = resize_size
+        if stride is None:
+            self.stride = patch_size
+        else:
+            self.stride = stride
+        self.downsample_factor = downsample_factor
+        self.with_instance_masking = with_instance_masking
+        self.verbose = verbose
+        if normalizer is not None:
+            self.normalizer = normalizer.get("type", "unknown")
+        else:
+            self.normalizer = None
+        super().__init__(**kwargs)
+
+        # Handle GPU
+        cuda = torch.cuda.is_available()
+        self.device = torch.device("cuda:0" if cuda else "cpu")
+
+        if normalizer is not None:
+            self.normalizer_mean = normalizer.get("mean", [0, 0, 0])
+            self.normalizer_std = normalizer.get("std", [1, 1, 1])
+        else:
+            self.normalizer_mean = [0.485, 0.456, 0.406]
+            self.normalizer_std = [0.229, 0.224, 0.225]
+        self.patch_feature_extractor = PatchHoverNetFeatureExtractor(
+            model_path=model_path,
+            device=self.device,
+            patch_size=patch_size,
+            extraction_layer=extraction_layer,
+        )
+        self.fill_value = fill_value
+        self.batch_size = batch_size
+        self.model_path = model_path
+        self.num_workers = num_workers
+        if self.num_workers in [0, 1]:
+            torch.set_num_threads(1)
+
+    def _collate_patches(self, batch):
+        """Patch collate function"""
+        instance_indices = [item[0] for item in batch]
+        patches = [item[1] for item in batch]
+        patches = torch.stack(patches)
+        return instance_indices, patches
+
+    def _extract_features(
+        self,
+        input_image: np.ndarray,
+        instance_map: np.ndarray,
+        transform: Optional[Callable] = None,
+    ) -> torch.Tensor:
+        """
+        Extract features for a given RGB image and its extracted instance_map.
+
+        Args:
+            input_image (np.ndarray): RGB input image.
+            instance_map (np.ndarray): Extracted instance_map.
+            transform (Callable): Transform to apply. Defaults to None.
+        Returns:
+            torch.Tensor: Extracted features of shape [nr_instances, nr_features]
+        """
+        if self.downsample_factor != 1:
+            input_image = self._downsample(input_image, self.downsample_factor)
+            instance_map = self._downsample(instance_map, self.downsample_factor)
+
+        image_dataset = InstanceMapPatchDataset(
+            image=input_image,
+            instance_map=instance_map,
+            resize_size=self.resize_size,
+            patch_size=self.patch_size,
+            stride=self.stride,
+            fill_value=self.fill_value,
+            mean=self.normalizer_mean,
+            std=self.normalizer_std,
+            transform=transform,
+            with_instance_masking=self.with_instance_masking,
+        )
+        image_loader = DataLoader(
+            image_dataset,
+            shuffle=False,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            collate_fn=self._collate_patches,
+        )
+        features = torch.empty(
+            size=(
+                len(image_dataset.properties),
+                self.patch_feature_extractor.num_features,
+            ),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        embeddings = dict()
+        for instance_indices, patches in tqdm(
+            image_loader, total=len(image_loader), disable=not self.verbose
+        ):
+            emb = self.patch_feature_extractor(patches)
+            for j, key in enumerate(instance_indices):
+                if key in embeddings:
+                    embeddings[key][0] += emb[j]
+                    embeddings[key][1] += 1
+                else:
+                    embeddings[key] = [emb[j], 1]
+
+        for k, v in embeddings.items():
+            features[k, :] = v[0] / v[1]
+
+        return features.cpu().detach()
+
 
 def _build_augmentations(
     rotations: Optional[List[int]] = None,

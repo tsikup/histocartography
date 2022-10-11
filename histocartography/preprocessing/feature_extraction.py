@@ -80,7 +80,7 @@ class FeatureExtractor(PipelineStep):
             self._link_to_path(Path(link_path) / "features")
 
     @staticmethod
-    def _preprocess_architecture(architecture: str) -> str:
+    def _preprocess_architecture(architecture: Union[str, nn.Module]) -> Union[str, nn.Module]:
         """
         Preprocess the architecture string to avoid characters that are not allowed as paths.
 
@@ -90,19 +90,22 @@ class FeatureExtractor(PipelineStep):
         Returns:
             str: Architecture name to use for the save path.
         """
-        if architecture.startswith("s3://mlflow"):
-            processed_architecture = architecture[5:].split("/")
-            if len(processed_architecture) == 5:
-                _, experiment_id, run_id, _, metric = processed_architecture
-                return f"MLflow({experiment_id},{run_id},{metric})"
-            elif len(processed_architecture) == 4:
-                _, experiment_id, _, name = processed_architecture
-                return f"MLflow({experiment_id},{name})"
+        if isinstance(architecture, str):
+            if architecture.startswith("s3://mlflow"):
+                processed_architecture = architecture[5:].split("/")
+                if len(processed_architecture) == 5:
+                    _, experiment_id, run_id, _, metric = processed_architecture
+                    return f"MLflow({experiment_id},{run_id},{metric})"
+                elif len(processed_architecture) == 4:
+                    _, experiment_id, _, name = processed_architecture
+                    return f"MLflow({experiment_id},{name})"
+                else:
+                    return f"MLflow({','.join(processed_architecture)})"
+            elif architecture.endswith(".pth"):
+                return f"Local({architecture.replace('/', '_')})"
             else:
-                return f"MLflow({','.join(processed_architecture)})"
-        elif architecture.endswith(".pth"):
-            return f"Local({architecture.replace('/', '_')})"
-        else:
+                return architecture
+        elif isinstance(architecture, nn.Module):
             return architecture
 
     @staticmethod
@@ -325,7 +328,7 @@ class PatchFeatureExtractor:
 
     def __init__(
         self,
-        architecture: str,
+        architecture: Union[str, nn.Module],
         device: torch.device,
         patch_size: int,
         extraction_layer: Optional[str] = None
@@ -341,16 +344,19 @@ class PatchFeatureExtractor:
         """
         self.device = device
 
-        if architecture.startswith("s3://mlflow"):
-            model = self._get_mlflow_model(url=architecture)
-        elif architecture.endswith(".pth"):
-            model = self._get_local_model(path=architecture)
-        else:
-            model = self._get_torchvision_model(architecture).to(self.device)
+        if isinstance(architecture, str):
+            if architecture.startswith("s3://mlflow"):
+                model = self._get_mlflow_model(url=architecture)
+            elif architecture.endswith(".pth"):
+                model = self._get_local_model(path=architecture)
+            else:
+                model = self._get_torchvision_model(architecture).to(self.device)
 
-        self._validate_model(model)
-        self.model = self._remove_layers(model, extraction_layer)
-        self.num_features = self._get_num_features(model, patch_size)
+            self._validate_model(model)
+            self.model = self._remove_layers(model, extraction_layer)
+        elif isinstance(architecture, nn.Module):
+            self.model = architecture
+        self.num_features = self._get_num_features(self.model, patch_size)
         self.model.eval()
 
     @staticmethod
@@ -691,7 +697,7 @@ class DeepFeatureExtractor(FeatureExtractor):
 
     def __init__(
         self,
-        architecture: str,
+        architecture: Union[str, nn.Module],
         patch_size: int,
         resize_size: int = None,
         stride: int = None,
@@ -709,7 +715,7 @@ class DeepFeatureExtractor(FeatureExtractor):
         Create a deep feature extractor.
 
         Args:
-            architecture (str): Name of the architecture to use. According to torchvision.models syntax.
+            architecture (str or nn.Module): Name of the architecture to use. According to torchvision.models syntax.
             patch_size (int): Desired size of patch.
             resize_size (int): Desired resized size to input the network. If None, no resizing is done and the
                                patches of size patch_size are provided to the network. Defaults to None.
@@ -1018,7 +1024,7 @@ class MaskedGridPatchDataset(GridPatchDataset):
 class GridDeepFeatureExtractor(FeatureExtractor):
     def __init__(
         self,
-        architecture: str,
+        architecture: Union[str, nn.Module],
         patch_size: int,
         resize_size: int = None,
         stride: int = None,
@@ -1321,7 +1327,7 @@ class PatchHoverNetFeatureExtractor:
 
     def __init__(
         self,
-        model_path,
+        model_path: Union[str, None],
         device: torch.device,
         patch_size: int,
         pretrained_data: str = "pannuke",
@@ -1414,7 +1420,7 @@ class HoverNetDeepFeatureExtractor(FeatureExtractor):
 
     def __init__(
         self,
-        model_path: str,
+        model_path: Union[str, None],
         patch_size: int,
         resize_size: int = None,
         stride: int = None,

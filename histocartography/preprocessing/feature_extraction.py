@@ -300,6 +300,8 @@ class HandcraftedFeatureExtractor(FeatureExtractor):
             return mean_crow, std_crow
         if n_centroids < k:
             k = n_centroids - 2
+        if n_centroids == k:
+            k = n_centroids - 1
         dist = euclidean_distances(centroids, centroids)
         idx = np.argpartition(dist, kth=k + 1, axis=-1)
         x = np.take_along_axis(dist, idx, axis=-1)[:, : k + 1]
